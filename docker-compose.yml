@@ -1,0 +1,151 @@
+
+services:
+  # ============================================================================
+  # SHARD 1: US-EAST (North American Fleet)
+  # REVERSED REPLICATION AFTER MANUAL FAILOVER
+  # ============================================================================
+
+  # PROMOTED DATABASE: NOW THE AUTHORITATIVE US PRIMARY
+  shard-us-replica:
+    image: postgres:16-alpine
+    container_name: shard-us-replica
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: rootpassword
+      POSTGRES_DB: geofleet
+      PGDATA: /var/lib/postgresql/data
+    ports:
+      - "5435:5432"
+    volumes:
+      - us_replica_data:/var/lib/postgresql/data
+    command: >
+      postgres
+      -c wal_level=replica
+      -c max_wal_senders=10
+      -c max_replication_slots=10
+      -c hot_standby=on
+      -c max_prepared_transactions=50
+    networks:
+      - geofleet-net
+
+  # ORIGINAL PRIMARY: NOW REJOINING AS A STANDBY
+  shard-us-primary:
+    image: postgres:16-alpine
+    container_name: shard-us-primary
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: rootpassword
+      POSTGRES_DB: geofleet
+      PRIMARY_HOST: shard-us-replica
+      PGDATA: /var/lib/postgresql/data
+    ports:
+      - "5431:5432"
+    volumes:
+      - us_primary_data:/var/lib/postgresql/data
+      - ./init/entrypoint-replica.sh:/entrypoint-replica.sh
+    entrypoint: ["/entrypoint-replica.sh"]
+    depends_on:
+      - shard-us-replica
+    networks:
+      - geofleet-net
+
+  # ============================================================================
+  # SHARD 2: EU-WEST (European Fleet)
+  # ORIGINAL CONFIGURATION PRESERVED
+  # ============================================================================
+
+  shard-eu-primary:
+    image: postgres:16-alpine
+    container_name: shard-eu-primary
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: rootpassword
+      POSTGRES_DB: geofleet
+    ports:
+      - "5433:5432"
+    volumes:
+      - ./init/00-config-hba.sh:/docker-entrypoint-initdb.d/00-config-hba.sh
+      - ./init/01-init-cluster.sql:/docker-entrypoint-initdb.d/01-init-cluster.sql
+    command: >
+      postgres
+      -c wal_level=replica
+      -c max_wal_senders=10
+      -c max_replication_slots=10
+      -c hot_standby=on
+      -c max_prepared_transactions=50
+    networks:
+      - geofleet-net
+
+  shard-eu-replica:
+    image: postgres:16-alpine
+    container_name: shard-eu-replica
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: rootpassword
+      POSTGRES_DB: geofleet
+      PRIMARY_HOST: shard-eu-primary
+      PGDATA: /var/lib/postgresql/data
+    ports:
+      - "5434:5432"
+    volumes:
+      - ./init/entrypoint-replica.sh:/entrypoint-replica.sh
+    entrypoint: ["/entrypoint-replica.sh"]
+    depends_on:
+      - shard-eu-primary
+    networks:
+      - geofleet-net
+
+  # ============================================================================
+  # GEOFLEET APPLICATION GATEWAY & 2PC COORDINATOR
+  # ============================================================================
+
+  geofleet-api:
+    build:
+      context: ./geofleet-app
+      dockerfile: Dockerfile
+    container_name: geofleet-api
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./geofleet-app/app:/app/app
+    environment:
+      # US routing: promoted replica is now the primary
+      HOST_US_PRIMARY: shard-us-replica
+      PORT_US_PRIMARY: 5432
+      HOST_US_REPLICA: shard-us-primary
+      PORT_US_REPLICA: 5432
+
+      # EU routing: unchanged
+      HOST_EU_PRIMARY: shard-eu-primary
+      PORT_EU_PRIMARY: 5432
+      HOST_EU_REPLICA: shard-eu-replica
+      PORT_EU_REPLICA: 5432
+    depends_on:
+      - shard-us-primary
+      - shard-us-replica
+      - shard-eu-primary
+      - shard-eu-replica
+    networks:
+      - geofleet-net
+
+# ============================================================================
+# EXISTING PERSISTENT US DATABASE VOLUMES
+# ============================================================================
+
+volumes:
+  us_primary_data:
+    external: true
+    name: geofleet_us_primary_data
+
+  us_replica_data:
+    external: true
+    name: geofleet_us_replica_data
+
+# ============================================================================
+# NETWORK
+# ============================================================================
+
+networks:
+  geofleet-net:
+    name: geofleet-net
+    driver: bridge
